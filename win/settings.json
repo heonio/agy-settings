@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File %USERPROFILE%\\.antigravity\\statusline.ps1 --classic",
+    "enabled": true
+  }
+}
