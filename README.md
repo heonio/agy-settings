@@ -2,6 +2,9 @@
 
 Google DeepMind Antigravity CLI(`agy`)의 상태줄(statusline) 스크립트 및 환경별 설정을 관리하는 저장소입니다.
 
+> [!NOTE]
+> 이 저장소의 상태줄(statusline) 스크립트는 [weby-homelab/antigravity-cli-statusline](https://github.com/weby-homelab/antigravity-cli-statusline) 프로젝트를 기반으로 시작되어, 폰트 의존성 제거(클래식 유니코드/이모지 기본값 적용), macOS 환경의 배터리 유무 자동 감지(Auto ON/OFF), 쿼터 리셋 시각 파싱 강화 등의 개선을 거쳐 구성되었습니다.
+
 ---
 
 ## 📁 디렉터리 구성
@@ -43,3 +46,9 @@ ln -sf "$(pwd)/mac/statusline.py" ~/.gemini/statusline.py
 ```
 
 자세한 설정 방법 및 테스트 가이드는 [`mac/README.md`](./mac/README.md) 문서를 참고하세요.
+
+---
+
+## 🔗 출처 및 참고 (Credits)
+
+* 원본 프로젝트: [weby-homelab/antigravity-cli-statusline](https://github.com/weby-homelab/antigravity-cli-statusline)
