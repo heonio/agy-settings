@@ -91,15 +91,238 @@ $CTX_USED = $INPUT_TOKENS + $OUTPUT_TOKENS
 $REM_PCT = if ($data.context_window.remaining_percentage -ne $null) { $data.context_window.remaining_percentage } else { 100 }
 
 # Quotas
+function extract_reset_sec($q_obj) {
+    if ($null -eq $q_obj) { return -1 }
+    foreach ($k in @("reset_in_seconds", "reset_seconds")) {
+        $v = $q_obj.$k
+        if ($null -ne $v) {
+            try { return [int]$v } catch {}
+        }
+    }
+    foreach ($k in @("reset_time", "reset_at", "resetTime", "resetAt")) {
+        $v = $q_obj.$k
+        if ($null -ne $v) {
+            if ($v -is [int] -or $v -is [long] -or $v -is [double]) {
+                $now_sec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                $diff = [int]([double]$v - $now_sec)
+                return [Math]::Max(0, $diff)
+            }
+            if ($v -is [string] -and $v.Length -gt 0) {
+                try {
+                    $dt = [DateTimeOffset]::Parse($v, [System.Globalization.CultureInfo]::InvariantCulture)
+                    $diff = [int]($dt.ToUnixTimeSeconds() - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+                    return [Math]::Max(0, $diff)
+                } catch {}
+            }
+        }
+    }
+    return -1
+}
+
 $GEMINI_5H = if ($data.quota.'gemini-5h'.remaining_fraction -ne $null) { [Math]::Round($data.quota.'gemini-5h'.remaining_fraction * 100, 1) } else { -1 }
 $GEMINI_WK = if ($data.quota.'gemini-weekly'.remaining_fraction -ne $null) { [Math]::Round($data.quota.'gemini-weekly'.remaining_fraction * 100, 1) } else { -1 }
 $TP_5H = if ($data.quota.'3p-5h'.remaining_fraction -ne $null) { [Math]::Round($data.quota.'3p-5h'.remaining_fraction * 100, 1) } else { -1 }
 $TP_WK = if ($data.quota.'3p-weekly'.remaining_fraction -ne $null) { [Math]::Round($data.quota.'3p-weekly'.remaining_fraction * 100, 1) } else { -1 }
 
-$GEMINI_5H_RESET = if ($data.quota.'gemini-5h'.reset_in_seconds -ne $null) { $data.quota.'gemini-5h'.reset_in_seconds } else { -1 }
-$GEMINI_WK_RESET = if ($data.quota.'gemini-weekly'.reset_in_seconds -ne $null) { $data.quota.'gemini-weekly'.reset_in_seconds } else { -1 }
-$TP_5H_RESET = if ($data.quota.'3p-5h'.reset_in_seconds -ne $null) { $data.quota.'3p-5h'.reset_in_seconds } else { -1 }
-$TP_WK_RESET = if ($data.quota.'3p-weekly'.reset_in_seconds -ne $null) { $data.quota.'3p-weekly'.reset_in_seconds } else { -1 }
+$GEMINI_5H_RESET = extract_reset_sec $data.quota.'gemini-5h'
+$GEMINI_WK_RESET = extract_reset_sec $data.quota.'gemini-weekly'
+$TP_5H_RESET = extract_reset_sec $data.quota.'3p-5h'
+$TP_WK_RESET = extract_reset_sec $data.quota.'3p-weekly'
+
+# Gemini Quota Cache Lookup (2-minute TTL)
+$GEMINI_QUOTA_CACHE_TTL = 120 # 2 minutes (between 1 and 3 minutes)
+
+function Get-AgyAccessToken {
+    $candidates = @()
+    if ($env:AGY_CONFIG_DIR) {
+        $candidates += (Join-Path $env:AGY_CONFIG_DIR "antigravity-oauth-token")
+    }
+    $userHome = [Environment]::GetFolderPath("UserProfile")
+    if (-not $userHome) { $userHome = $HOME }
+    $candidates += (Join-Path $userHome ".gemini\antigravity-cli\antigravity-oauth-token")
+    $candidates += (Join-Path $userHome ".antigravity\antigravity-oauth-token")
+
+    $raw = $null
+    foreach ($p in $candidates) {
+        if (Test-Path $p) {
+            try {
+                $raw = (Get-Content -Path $p -Raw -ErrorAction Stop).Trim()
+                if ($raw) { break }
+            } catch {}
+        }
+    }
+
+    # Fallback: Windows Credential Manager (go-keyring stores target "gemini:antigravity")
+    if (-not $raw) {
+        try {
+            if (-not ([System.Management.Automation.PSTypeName]'AgyWinCred').Type) {
+                Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class AgyWinCred {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CredReadW(string target, uint type, int reservedFlag, out IntPtr credentialPtr);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern void CredFree(IntPtr cred);
+
+    public static string GetPassword(string target) {
+        IntPtr credPtr;
+        if (!CredReadW(target, 1, 0, out credPtr)) return null;
+        try {
+            CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL));
+            if (cred.CredentialBlob == IntPtr.Zero || cred.CredentialBlobSize == 0) return null;
+            byte[] bytes = new byte[cred.CredentialBlobSize];
+            Marshal.Copy(cred.CredentialBlob, bytes, 0, (int)cred.CredentialBlobSize);
+            string utf8 = Encoding.UTF8.GetString(bytes);
+            if (utf8.Contains("access_token")) return utf8;
+            return Encoding.Unicode.GetString(bytes);
+        } finally {
+            CredFree(credPtr);
+        }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+            }
+            foreach ($target in @("gemini:antigravity", "antigravity-oauth-token")) {
+                $credVal = [AgyWinCred]::GetPassword($target)
+                if ($credVal) {
+                    $raw = $credVal.Trim()
+                    break
+                }
+            }
+        } catch {}
+    }
+
+    if (-not $raw) { return $null }
+
+    if ($raw.StartsWith("go-keyring-base64:")) {
+        try {
+            $b64 = $raw.Substring("go-keyring-base64:".Length)
+            $raw = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+        } catch { return $null }
+    }
+
+    try {
+        $tok = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($tok.access_token) { return [string]$tok.access_token }
+    } catch {}
+    return $null
+}
+
+function Get-CachedGeminiQuota($modelName) {
+    $userHome = [Environment]::GetFolderPath("UserProfile")
+    if (-not $userHome) { $userHome = $HOME }
+    $cacheDir = if ($env:AGY_CONFIG_DIR) { Join-Path $env:AGY_CONFIG_DIR "cache" } else { Join-Path $userHome ".gemini\antigravity-cli\cache" }
+    $cacheFile = Join-Path $cacheDir "gemini_quota_cache.json"
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+    $cacheData = $null
+    if (Test-Path $cacheFile) {
+        try {
+            $cacheData = Get-Content -Path $cacheFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch { $cacheData = $null }
+    }
+
+    $needFetch = $true
+    if ($null -ne $cacheData -and $null -ne $cacheData.fetched_at) {
+        if (($now - [long]$cacheData.fetched_at) -lt $GEMINI_QUOTA_CACHE_TTL) {
+            $needFetch = $false
+        }
+    }
+
+    if ($needFetch) {
+        $token = Get-AgyAccessToken
+        if ($token) {
+            try {
+                if (-not (Test-Path $cacheDir)) {
+                    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+                }
+            } catch {
+                $cacheFile = Join-Path $env:TEMP "agy_gemini_quota_cache.json"
+            }
+
+            try {
+                $headers = @{
+                    "Authorization" = "Bearer $token"
+                    "Content-Type"  = "application/json"
+                    "User-Agent"    = "antigravity/1.4.5 windows/amd64"
+                }
+                $resp = Invoke-RestMethod -Uri "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels" -Method Post -Headers $headers -Body "{}" -TimeoutSec 2 -ErrorAction Stop
+                if ($null -ne $resp -and $null -ne $resp.models) {
+                    $modelsQuota = @{}
+                    foreach ($prop in $resp.models.PSObject.Properties) {
+                        $mKey = $prop.Name
+                        $mVal = $prop.Value
+                        if ($null -ne $mVal -and $null -ne $mVal.quotaInfo) {
+                            $qInfo = $mVal.quotaInfo
+                            if ($null -ne $qInfo.remainingFraction) {
+                                $modelsQuota[$mKey] = @{
+                                    remaining_fraction = [double]$qInfo.remainingFraction
+                                    reset_time         = [string]$qInfo.resetTime
+                                }
+                            }
+                        }
+                    }
+                    $cacheObj = @{
+                        fetched_at = $now
+                        models     = $modelsQuota
+                    }
+                    try {
+                        $tmpFile = "$cacheFile.tmp"
+                        $cacheObj | ConvertTo-Json -Depth 5 -Compress | Set-Content -Path $tmpFile -Encoding UTF8 -ErrorAction Stop
+                        Move-Item -Path $tmpFile -Destination $cacheFile -Force -ErrorAction Stop
+                    } catch {}
+                    $cacheData = $cacheObj | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+                }
+            } catch {}
+        }
+    }
+
+    if ($null -eq $cacheData -or $null -eq $cacheData.models) { return $null }
+
+    $mLow = if ($modelName) { $modelName.ToLower() } else { "" }
+    $targetInfo = $null
+
+    if ($mLow -and $null -ne $cacheData.models.$mLow) {
+        $targetInfo = $cacheData.models.$mLow
+    } else {
+        $pref = if ($mLow -match "flash") { "gemini-3-flash" } elseif ($mLow -match "pro") { "gemini-3.1-pro-high" } else { "gemini-3.1-pro-high" }
+        if ($null -ne $cacheData.models.$pref) {
+            $targetInfo = $cacheData.models.$pref
+        } else {
+            foreach ($prop in $cacheData.models.PSObject.Properties) {
+                if ($prop.Name -like "gemini-*") {
+                    $targetInfo = $prop.Value
+                    break
+                }
+            }
+        }
+    }
+
+    if ($null -eq $targetInfo -or $null -eq $targetInfo.remaining_fraction) { return $null }
+    $remPct = [Math]::Round([double]$targetInfo.remaining_fraction * 100, 1)
+    $rstSec = extract_reset_sec $targetInfo
+    return @($remPct, $rstSec)
+}
 
 # ANSI Helpers
 $ESC = [char]27
@@ -595,13 +818,41 @@ function make_quota_bar($val, $label, $bar_color, $reset_sec, $show_bar = $SHOW_
     return "${separator}${FG_BRIGHT_WHITE}${B}${label}${R} ${bar_str}${text_color}${val_fmt}%${R}${reset_str}"
 }
 
-# Determine active quota based on actual availability
-if (($GEMINI_5H -ne $null -and $GEMINI_5H -ne -1) -or ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1)) {
+# Determine active quota based on current model first, then fallback to available data
+$modelCheck = "$MODEL_ID $MODEL".ToLower()
+$isGeminiModel = $modelCheck -match "gemini"
+$is3pModel = $modelCheck -match "claude|gpt|o1|o3|sonnet|opus|haiku"
+
+$hasGeminiQuota = ($GEMINI_5H -ne $null -and $GEMINI_5H -ne -1) -or ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1)
+$hasTpQuota = ($TP_5H -ne $null -and $TP_5H -ne -1) -or ($TP_WK -ne $null -and $TP_WK -ne -1)
+
+# If using a Gemini model and stdin has no gemini-5h quota, query cached endpoint (TTL 2m)
+if ($isGeminiModel -and -not $hasGeminiQuota) {
+    $targetModel = if ($MODEL_ID) { $MODEL_ID } else { $MODEL }
+    $cachedGem = Get-CachedGeminiQuota $targetModel
+    if ($null -ne $cachedGem) {
+        $GEMINI_5H = $cachedGem[0]
+        $GEMINI_5H_RESET = $cachedGem[1]
+        $hasGeminiQuota = $true
+    }
+}
+
+if ($isGeminiModel -and $hasGeminiQuota) {
     $Q_5H = $GEMINI_5H
-    $Q_WK = $GEMINI_WK
+    $Q_WK = if ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1) { $GEMINI_WK } else { $TP_WK }
     $Q_5H_R = $GEMINI_5H_RESET
-    $Q_WK_R = $GEMINI_WK_RESET
-} elseif (($TP_5H -ne $null -and $TP_5H -ne -1) -or ($TP_WK -ne $null -and $TP_WK -ne -1)) {
+    $Q_WK_R = if ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1) { $GEMINI_WK_RESET } else { $TP_WK_RESET }
+} elseif ($is3pModel -and $hasTpQuota) {
+    $Q_5H = $TP_5H
+    $Q_WK = $TP_WK
+    $Q_5H_R = $TP_5H_RESET
+    $Q_WK_R = $TP_WK_RESET
+} elseif ($hasGeminiQuota) {
+    $Q_5H = $GEMINI_5H
+    $Q_WK = if ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1) { $GEMINI_WK } else { $TP_WK }
+    $Q_5H_R = $GEMINI_5H_RESET
+    $Q_WK_R = if ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1) { $GEMINI_WK_RESET } else { $TP_WK_RESET }
+} elseif ($hasTpQuota) {
     $Q_5H = $TP_5H
     $Q_WK = $TP_WK
     $Q_5H_R = $TP_5H_RESET
