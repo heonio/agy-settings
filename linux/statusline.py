@@ -679,7 +679,9 @@ try:
             except Exception:
                 pass
         elif sys.platform == "darwin":
-            token_raw = run_command(["security", "find-generic-password", "-s", "antigravity-oauth-token", "-w"], timeout_ms=800)
+            token_raw = run_command(["security", "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w"], timeout_ms=800)
+            if not token_raw:
+                token_raw = run_command(["security", "find-generic-password", "-s", "antigravity-oauth-token", "-w"], timeout_ms=800)
             if not token_raw:
                 token_raw = run_command(["security", "find-generic-password", "-a", "antigravity-oauth-token", "-w"], timeout_ms=800)
 
