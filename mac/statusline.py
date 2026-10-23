@@ -9,7 +9,12 @@ import subprocess
 import shutil
 import re
 import time
+import base64
+import tempfile
+import urllib.request
 from datetime import datetime, timezone
+
+GEMINI_QUOTA_CACHE_TTL = 120  # Seconds (2 minutes) between fetchAvailableModels quota lookups
 
 def extract_reset_sec(d):
     if not isinstance(d, dict):
@@ -88,8 +93,8 @@ def print_legend():
     print(f"  Conversation ID      {GR}󰍪           {GR}(Text)      {R}Short prefix of the current session ID.")
     print(f"  Tokens Sum           {Y}           {GR}(None)      {R}Total input/output tokens parsed.")
     print(f"  Quota Reset Time     {GR}⌛️          {GR}⌛          {R}Remaining time until LLM quota resets.")
-    print(f"  Power Mains (AC)     {G}󰚥           {G}⚡:{cap}%     {R}MacBook connected to AC power (shows charge %).")
-    print(f"  Power Battery (BAT)  {Y}🔋           {Y}🔋:{cap}%     {R}MacBook running on battery (shows charge %).")
+    print(f"  Power Mains (AC)     {G}󰚥           {G}⚡:{{cap}}%     {R}MacBook connected to AC power (shows charge %).")
+    print(f"  Power Battery (BAT)  {Y}🔋           {Y}🔋:{{cap}}%     {R}MacBook running on battery (shows charge %).")
     print(f"  Desktop Mac Power    {GR}(Hidden)     {GR}(Hidden)    {R}Auto-disabled on Mac mini, Studio, Pro, iMac.")
     print(f"  Account & Tier       {GR}󰇮           {GR}✉           {R}Current plan tier & user email.")
     
@@ -625,8 +630,163 @@ try:
         val_fmt = f"{val:.1f}"
         return f"{separator}{FG_BRIGHT_WHITE}{B}{label}{R} {bar_str}{text_color}{val_fmt}%{R}{reset_str}"
 
-    # Determine active quota based on actual availability
-    if (GEMINI_5H is not None and GEMINI_5H != -1) or (GEMINI_WK is not None and GEMINI_WK != -1):
+    # Determine active quota based on current model family & availability
+    def load_agy_access_token():
+        token_raw = None
+        token_file = os.path.expanduser("~/.gemini/antigravity-cli/antigravity-oauth-token")
+        if os.path.exists(token_file):
+            try:
+                with open(token_file, "r", encoding="utf-8") as f:
+                    token_raw = f.read().strip()
+            except Exception:
+                pass
+        elif sys.platform == "darwin":
+            token_raw = run_command(["security", "find-generic-password", "-s", "antigravity-oauth-token", "-w"], timeout_ms=800)
+            if not token_raw:
+                token_raw = run_command(["security", "find-generic-password", "-a", "antigravity-oauth-token", "-w"], timeout_ms=800)
+
+        if not token_raw:
+            return None
+
+        if token_raw.startswith("go-keyring-base64:"):
+            try:
+                token_raw = base64.b64decode(token_raw.split(":", 1)[1]).decode("utf-8")
+            except Exception:
+                return None
+
+        try:
+            tok_obj = json.loads(token_raw)
+            if isinstance(tok_obj, dict):
+                nested = tok_obj.get("token")
+                if isinstance(nested, dict) and nested.get("access_token"):
+                    return nested.get("access_token")
+                if tok_obj.get("access_token"):
+                    return tok_obj.get("access_token")
+        except Exception:
+            pass
+        return None
+
+    def get_cached_gemini_quota(model_id="", ttl_sec=GEMINI_QUOTA_CACHE_TTL):
+        cache_dir = os.path.expanduser("~/.gemini/antigravity-cli/cache")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, "gemini_quota_cache.json")
+        except Exception:
+            uid_suffix = f"_{os.getuid()}" if hasattr(os, "getuid") else ""
+            cache_file = os.path.join(tempfile.gettempdir(), f"agy_gemini_quota_cache{uid_suffix}.json")
+        now = time.time()
+
+        cached = None
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+            except Exception:
+                cached = None
+
+        def select_from_cache(c):
+            if not isinstance(c, dict):
+                return None
+            models_map = c.get("models")
+            if isinstance(models_map, dict) and model_id and model_id in models_map:
+                return models_map[model_id]
+            if c.get("remaining_fraction") is not None:
+                return {
+                    "remaining_fraction": c.get("remaining_fraction"),
+                    "reset_time": c.get("reset_time"),
+                }
+            return None
+
+        if isinstance(cached, dict) and (now - (cached.get("fetched_at") or 0)) < ttl_sec:
+            hit = select_from_cache(cached)
+            if hit is not None:
+                return hit
+
+        # Cache miss or expired: query fetchAvailableModels
+        access_token = load_agy_access_token()
+        if access_token:
+            try:
+                ua_ver = CLI_VERSION if CLI_VERSION else "1.4.5"
+                ua_plat = "darwin" if sys.platform == "darwin" else "linux"
+                req = urllib.request.Request(
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                    data=b"{}",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": f"antigravity/{ua_ver} {ua_plat}/amd64",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    fam = json.loads(resp.read().decode("utf-8"))
+
+                models_raw = fam.get("models") if isinstance(fam, dict) else {}
+                gemini_models = {}
+                default_frac = None
+                default_reset = None
+
+                if isinstance(models_raw, dict):
+                    for mid, minfo in models_raw.items():
+                        if not isinstance(minfo, dict):
+                            continue
+                        m_sig = f"{mid} {minfo.get('displayName', '')} {minfo.get('modelProvider', '')}".lower()
+                        if "gemini" in m_sig or "google" in m_sig:
+                            qinfo = minfo.get("quotaInfo")
+                            if isinstance(qinfo, dict) and qinfo.get("remainingFraction") is not None:
+                                frac = float(qinfo["remainingFraction"])
+                                rtime = qinfo.get("resetTime")
+                                if rtime:
+                                    gemini_models[mid] = {"remaining_fraction": frac, "reset_time": rtime}
+                                    if default_frac is None:
+                                        default_frac = frac
+                                        default_reset = rtime
+
+                if default_frac is not None:
+                    new_cache = {
+                        "fetched_at": now,
+                        "remaining_fraction": default_frac,
+                        "reset_time": default_reset,
+                        "models": gemini_models,
+                    }
+                    try:
+                        tmp_file = f"{cache_file}.{os.getpid()}.tmp"
+                        with open(tmp_file, "w", encoding="utf-8") as f:
+                            json.dump(new_cache, f)
+                        os.replace(tmp_file, cache_file)
+                    except Exception:
+                        pass
+                    return select_from_cache(new_cache)
+            except Exception:
+                pass
+
+        # Fallback to stale cache if its reset_time has not passed yet
+        hit = select_from_cache(cached)
+        if hit is not None and extract_reset_sec(hit) > 0:
+            return hit
+        return None
+
+    model_sig = f"{MODEL_ID} {MODEL_NAME}".lower()
+    is_gemini_model = "gemini" in model_sig
+    is_3p_model = any(k in model_sig for k in ("claude", "sonnet", "opus", "haiku", "gpt", "o1", "o3", "o4", "3p"))
+
+    if is_gemini_model and (GEMINI_5H is None or GEMINI_5H == -1) and (GEMINI_WK is None or GEMINI_WK == -1):
+        g_quota = get_cached_gemini_quota(MODEL_ID, ttl_sec=GEMINI_QUOTA_CACHE_TTL)
+        if isinstance(g_quota, dict) and g_quota.get("remaining_fraction") is not None:
+            GEMINI_5H = round(float(g_quota["remaining_fraction"]) * 100, 1)
+            GEMINI_5H_RESET = extract_reset_sec(g_quota)
+
+    if is_gemini_model:
+        Q_5H = GEMINI_5H
+        Q_WK = GEMINI_WK
+        Q_5H_R = GEMINI_5H_RESET
+        Q_WK_R = GEMINI_WK_RESET
+    elif is_3p_model:
+        Q_5H = TP_5H
+        Q_WK = TP_WK
+        Q_5H_R = TP_5H_RESET
+        Q_WK_R = TP_WK_RESET
+    elif (GEMINI_5H is not None and GEMINI_5H != -1) or (GEMINI_WK is not None and GEMINI_WK != -1):
         Q_5H = GEMINI_5H
         Q_WK = GEMINI_WK
         Q_5H_R = GEMINI_5H_RESET
