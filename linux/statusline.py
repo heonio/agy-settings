@@ -806,9 +806,120 @@ try:
             return hit
         return None
 
+    # Gemini 4 Argon has its own quota group (separate from Gemini / Claude+GPT groups)
+    def get_argon_quota(ttl_sec=GEMINI_QUOTA_CACHE_TTL):
+        """Return {"5h": {...}, "weekly": {...}} for the Argon quota group (values: remaining_fraction/reset_time)."""
+        cache_dir = os.path.expanduser("~/.gemini/antigravity-cli/cache")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_file = os.path.join(cache_dir, "argon_quota_cache.json")
+        except Exception:
+            uid_suffix = f"_{os.getuid()}" if hasattr(os, "getuid") else ""
+            cache_file = os.path.join(tempfile.gettempdir(), f"agy_argon_quota_cache{uid_suffix}.json")
+        now = time.time()
+
+        cached = None
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+            except Exception:
+                cached = None
+
+        def usable(c):
+            buckets = c.get("buckets") if isinstance(c, dict) else None
+            if not isinstance(buckets, dict) or not buckets:
+                return None
+            return buckets
+
+        if isinstance(cached, dict) and (now - (cached.get("fetched_at") or 0)) < ttl_sec:
+            hit = usable(cached)
+            if hit is not None:
+                return hit
+
+        access_token = load_agy_access_token()
+        if access_token:
+            try:
+                ua_ver = CLI_VERSION if CLI_VERSION else "1.4.5"
+                ua_plat = "darwin" if sys.platform == "darwin" else "linux"
+                req = urllib.request.Request(
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+                    data=b"{}",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": f"antigravity/{ua_ver} {ua_plat}/amd64",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    summary = json.loads(resp.read().decode("utf-8"))
+
+                found = {}
+                groups = summary.get("groups") if isinstance(summary, dict) else None
+                for grp in (groups if isinstance(groups, list) else []):
+                    if not isinstance(grp, dict):
+                        continue
+                    grp_sig = f"{grp.get('displayName', '')} {grp.get('description', '')}".lower()
+                    for bk in (grp.get("buckets") if isinstance(grp.get("buckets"), list) else []):
+                        if not isinstance(bk, dict) or bk.get("remainingFraction") is None:
+                            continue
+                        bk_sig = f"{bk.get('bucketId', '')} {grp_sig}".lower()
+                        if "argon" not in bk_sig:
+                            continue
+                        win = str(bk.get("window") or bk.get("bucketId") or "").lower()
+                        key = "weekly" if "week" in win else ("5h" if ("5h" in win or "five" in win) else None)
+                        if key:
+                            found[key] = {
+                                "remaining_fraction": float(bk["remainingFraction"]),
+                                "reset_time": bk.get("resetTime"),
+                            }
+                if found:
+                    try:
+                        tmp_file = f"{cache_file}.{os.getpid()}.tmp"
+                        with open(tmp_file, "w", encoding="utf-8") as f:
+                            json.dump({"fetched_at": now, "buckets": found}, f)
+                        os.replace(tmp_file, cache_file)
+                    except Exception:
+                        pass
+                    return found
+            except Exception:
+                pass
+
+        # Fallback to stale cache while reset time has not passed yet
+        hit = usable(cached)
+        if hit is not None and any(extract_reset_sec(v) > 0 for v in hit.values()):
+            return hit
+        return None
+
     model_sig = f"{MODEL_ID} {MODEL_NAME}".lower()
-    is_gemini_model = "gemini" in model_sig
+    is_argon_model = "argon" in model_sig
+    is_gemini_model = "gemini" in model_sig and not is_argon_model
     is_3p_model = any(k in model_sig for k in ("claude", "sonnet", "opus", "haiku", "gpt", "o1", "o3", "o4", "3p"))
+
+    # Argon: prefer quota entries supplied on stdin (any key containing "argon"), then query the API
+    ARGON_5H = ARGON_WK = -1
+    ARGON_5H_RESET = ARGON_WK_RESET = -1
+    if is_argon_model:
+        for qkey, qval in quota.items():
+            if "argon" not in str(qkey).lower() or not isinstance(qval, dict) or qval.get("remaining_fraction") is None:
+                continue
+            ql = str(qkey).lower()
+            if "week" in ql or "7d" in ql:
+                ARGON_WK = round(qval["remaining_fraction"] * 100, 1)
+                ARGON_WK_RESET = extract_reset_sec(qval)
+            elif "5h" in ql or "five" in ql:
+                ARGON_5H = round(qval["remaining_fraction"] * 100, 1)
+                ARGON_5H_RESET = extract_reset_sec(qval)
+        if ARGON_5H == -1 and ARGON_WK == -1:
+            a_quota = get_argon_quota()
+            if isinstance(a_quota, dict):
+                if isinstance(a_quota.get("weekly"), dict):
+                    ARGON_WK = round(float(a_quota["weekly"]["remaining_fraction"]) * 100, 1)
+                    ARGON_WK_RESET = extract_reset_sec(a_quota["weekly"])
+                if isinstance(a_quota.get("5h"), dict):
+                    ARGON_5H = round(float(a_quota["5h"]["remaining_fraction"]) * 100, 1)
+                    ARGON_5H_RESET = extract_reset_sec(a_quota["5h"])
 
     if is_gemini_model and (GEMINI_5H is None or GEMINI_5H == -1) and (GEMINI_WK is None or GEMINI_WK == -1):
         g_quota = get_cached_gemini_quota(MODEL_ID, ttl_sec=GEMINI_QUOTA_CACHE_TTL)
@@ -816,7 +927,13 @@ try:
             GEMINI_5H = round(float(g_quota["remaining_fraction"]) * 100, 1)
             GEMINI_5H_RESET = extract_reset_sec(g_quota)
 
-    if is_gemini_model:
+    if is_argon_model:
+        # Never fall back to the shared Gemini/3P quota: Argon has an independent limit
+        Q_5H = ARGON_5H
+        Q_WK = ARGON_WK
+        Q_5H_R = ARGON_5H_RESET
+        Q_WK_R = ARGON_WK_RESET
+    elif is_gemini_model:
         Q_5H = GEMINI_5H
         Q_WK = GEMINI_WK
         Q_5H_R = GEMINI_5H_RESET

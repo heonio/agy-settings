@@ -107,6 +107,11 @@ function extract_reset_sec($q_obj) {
                 $diff = [int]([double]$v - $now_sec)
                 return [Math]::Max(0, $diff)
             }
+            # ConvertFrom-Json auto-converts ISO8601 strings to [DateTime]
+            if ($v -is [datetime]) {
+                $diff = [int]([DateTimeOffset]$v).ToUnixTimeSeconds() - [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                return [Math]::Max(0, $diff)
+            }
             if ($v -is [string] -and $v.Length -gt 0) {
                 try {
                     $dt = [DateTimeOffset]::Parse($v, [System.Globalization.CultureInfo]::InvariantCulture)
@@ -322,6 +327,75 @@ function Get-CachedGeminiQuota($modelName) {
     $remPct = [Math]::Round([double]$targetInfo.remaining_fraction * 100, 1)
     $rstSec = extract_reset_sec $targetInfo
     return @($remPct, $rstSec)
+}
+
+# Gemini 4 Argon has its own quota group (independent from Gemini / Claude+GPT groups)
+function Get-ArgonQuota {
+    $userHome = [Environment]::GetFolderPath("UserProfile")
+    if (-not $userHome) { $userHome = $HOME }
+    $cacheDir = if ($env:AGY_CONFIG_DIR) { Join-Path $env:AGY_CONFIG_DIR "cache" } else { Join-Path $userHome ".gemini\antigravity-cli\cache" }
+    $cacheFile = Join-Path $cacheDir "argon_quota_cache.json"
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+    $cacheData = $null
+    if (Test-Path $cacheFile) {
+        try {
+            $cacheData = Get-Content -Path $cacheFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch { $cacheData = $null }
+    }
+
+    if ($null -ne $cacheData -and $null -ne $cacheData.fetched_at -and $null -ne $cacheData.buckets) {
+        if (($now - [long]$cacheData.fetched_at) -lt $GEMINI_QUOTA_CACHE_TTL) {
+            return $cacheData.buckets
+        }
+    }
+
+    $token = Get-AgyAccessToken
+    if ($token) {
+        try {
+            $headers = @{
+                "Authorization" = "Bearer $token"
+                "Content-Type"  = "application/json"
+                "User-Agent"    = "antigravity/1.4.5 windows/amd64"
+            }
+            $resp = Invoke-RestMethod -Uri "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary" -Method Post -Headers $headers -Body "{}" -TimeoutSec 2 -ErrorAction Stop
+            $found = @{}
+            foreach ($grp in @($resp.groups)) {
+                if ($null -eq $grp) { continue }
+                $grpSig = "$($grp.displayName) $($grp.description)"
+                foreach ($bk in @($grp.buckets)) {
+                    if ($null -eq $bk -or $null -eq $bk.remainingFraction) { continue }
+                    if (("$($bk.bucketId) $grpSig").ToLower() -notmatch "argon") { continue }
+                    $win = if ($bk.window) { "$($bk.window)" } else { "$($bk.bucketId)" }
+                    $win = $win.ToLower()
+                    $key = if ($win -match "week") { "weekly" } elseif ($win -match "5h|five") { "5h" } else { $null }
+                    if ($key) {
+                        $found[$key] = @{
+                            remaining_fraction = [double]$bk.remainingFraction
+                            reset_time         = [string]$bk.resetTime
+                        }
+                    }
+                }
+            }
+            if ($found.Count -gt 0) {
+                try {
+                    if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
+                    $tmpFile = "$cacheFile.tmp"
+                    @{ fetched_at = $now; buckets = $found } | ConvertTo-Json -Depth 5 -Compress | Set-Content -Path $tmpFile -Encoding UTF8 -ErrorAction Stop
+                    Move-Item -Path $tmpFile -Destination $cacheFile -Force -ErrorAction Stop
+                } catch {}
+                return ($found | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+            }
+        } catch {}
+    }
+
+    # Fall back to stale cache while its reset time has not passed yet
+    if ($null -ne $cacheData -and $null -ne $cacheData.buckets) {
+        foreach ($prop in $cacheData.buckets.PSObject.Properties) {
+            if ((extract_reset_sec $prop.Value) -gt 0) { return $cacheData.buckets }
+        }
+    }
+    return $null
 }
 
 # ANSI Helpers
@@ -819,8 +893,9 @@ function make_quota_bar($val, $label, $bar_color, $reset_sec, $show_bar = $SHOW_
 }
 
 # Determine active quota based on current model first, then fallback to available data
-$modelCheck = "$MODEL_ID $MODEL".ToLower()
-$isGeminiModel = $modelCheck -match "gemini"
+$modelCheck = "$MODEL_ID $MODEL_NAME".ToLower()
+$isArgonModel = $modelCheck -match "argon"
+$isGeminiModel = ($modelCheck -match "gemini") -and (-not $isArgonModel)
 $is3pModel = $modelCheck -match "claude|gpt|o1|o3|sonnet|opus|haiku"
 
 $hasGeminiQuota = ($GEMINI_5H -ne $null -and $GEMINI_5H -ne -1) -or ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1)
@@ -828,7 +903,7 @@ $hasTpQuota = ($TP_5H -ne $null -and $TP_5H -ne -1) -or ($TP_WK -ne $null -and $
 
 # If using a Gemini model and stdin has no gemini-5h quota, query cached endpoint (TTL 2m)
 if ($isGeminiModel -and -not $hasGeminiQuota) {
-    $targetModel = if ($MODEL_ID) { $MODEL_ID } else { $MODEL }
+    $targetModel = if ($MODEL_ID) { $MODEL_ID } else { $MODEL_NAME }
     $cachedGem = Get-CachedGeminiQuota $targetModel
     if ($null -ne $cachedGem) {
         $GEMINI_5H = $cachedGem[0]
@@ -837,7 +912,44 @@ if ($isGeminiModel -and -not $hasGeminiQuota) {
     }
 }
 
-if ($isGeminiModel -and $hasGeminiQuota) {
+# Argon: prefer stdin quota entries whose key contains "argon", then query the API
+$ARGON_5H = -1; $ARGON_WK = -1; $ARGON_5H_RESET = -1; $ARGON_WK_RESET = -1
+if ($isArgonModel) {
+    if ($null -ne $data.quota) {
+        foreach ($qp in $data.quota.PSObject.Properties) {
+            $ql = $qp.Name.ToLower()
+            if ($ql -notmatch "argon" -or $null -eq $qp.Value -or $null -eq $qp.Value.remaining_fraction) { continue }
+            if ($ql -match "week|7d") {
+                $ARGON_WK = [Math]::Round($qp.Value.remaining_fraction * 100, 1)
+                $ARGON_WK_RESET = extract_reset_sec $qp.Value
+            } elseif ($ql -match "5h|five") {
+                $ARGON_5H = [Math]::Round($qp.Value.remaining_fraction * 100, 1)
+                $ARGON_5H_RESET = extract_reset_sec $qp.Value
+            }
+        }
+    }
+    if ($ARGON_5H -eq -1 -and $ARGON_WK -eq -1) {
+        $aq = Get-ArgonQuota
+        if ($null -ne $aq) {
+            if ($null -ne $aq.weekly -and $null -ne $aq.weekly.remaining_fraction) {
+                $ARGON_WK = [Math]::Round([double]$aq.weekly.remaining_fraction * 100, 1)
+                $ARGON_WK_RESET = extract_reset_sec $aq.weekly
+            }
+            if ($null -ne $aq.'5h' -and $null -ne $aq.'5h'.remaining_fraction) {
+                $ARGON_5H = [Math]::Round([double]$aq.'5h'.remaining_fraction * 100, 1)
+                $ARGON_5H_RESET = extract_reset_sec $aq.'5h'
+            }
+        }
+    }
+}
+
+if ($isArgonModel) {
+    # Never fall back to the shared Gemini/3P quota: Argon has an independent limit
+    $Q_5H = $ARGON_5H
+    $Q_WK = $ARGON_WK
+    $Q_5H_R = $ARGON_5H_RESET
+    $Q_WK_R = $ARGON_WK_RESET
+} elseif ($isGeminiModel -and $hasGeminiQuota) {
     $Q_5H = $GEMINI_5H
     $Q_WK = if ($GEMINI_WK -ne $null -and $GEMINI_WK -ne -1) { $GEMINI_WK } else { $TP_WK }
     $Q_5H_R = $GEMINI_5H_RESET
